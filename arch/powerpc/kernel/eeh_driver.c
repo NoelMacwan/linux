@@ -447,8 +447,9 @@ static void *eeh_pe_detach_dev(void *data, void *userdata)
  * PE reset (for 3 times), we try to clear the frozen state
  * for 3 times as well.
  */
-static int eeh_clear_pe_frozen_state(struct eeh_pe *pe)
+static void *__eeh_clear_pe_frozen_state(void *data, void *flag)
 {
+	struct eeh_pe *pe = (struct eeh_pe *)data;
 	int i, rc;
 
 	for (i = 0; i < 3; i++) {
@@ -461,13 +462,24 @@ static int eeh_clear_pe_frozen_state(struct eeh_pe *pe)
 	}
 
 	/* The PE has been isolated, clear it */
-	if (rc)
+	if (rc) {
 		pr_warn("%s: Can't clear frozen PHB#%x-PE#%x (%d)\n",
 			__func__, pe->phb->global_number, pe->addr, rc);
-	else
+		return (void *)pe;
+	}
+
+	return NULL;
+}
+
+static int eeh_clear_pe_frozen_state(struct eeh_pe *pe)
+{
+	void *rc;
+
+	rc = eeh_pe_traverse(pe, __eeh_clear_pe_frozen_state, NULL);
+	if (!rc)
 		eeh_pe_state_clear(pe, EEH_PE_ISOLATED);
 
-	return rc;
+	return rc ? -EIO : 0;
 }
 
 /**
@@ -587,7 +599,7 @@ static void eeh_handle_normal_event(struct eeh_pe *pe)
 	pe->freeze_count++;
 	if (pe->freeze_count > EEH_MAX_ALLOWED_FREEZES)
 		goto excess_failures;
-	pr_warning("EEH: This PCI device has failed %d times in the last hour\n",
+	pr_warn("EEH: This PCI device has failed %d times in the last hour\n",
 		pe->freeze_count);
 
 	/* Walk the various device drivers attached to this slot through
@@ -604,7 +616,7 @@ static void eeh_handle_normal_event(struct eeh_pe *pe)
 	 */
 	rc = eeh_ops->wait_state(pe, MAX_WAIT_FOR_RECOVERY*1000);
 	if (rc < 0 || rc == EEH_STATE_NOT_SUPPORT) {
-		pr_warning("EEH: Permanent failure\n");
+		pr_warn("EEH: Permanent failure\n");
 		goto hard_fail;
 	}
 
@@ -623,8 +635,8 @@ static void eeh_handle_normal_event(struct eeh_pe *pe)
 		pr_info("EEH: Reset with hotplug activity\n");
 		rc = eeh_reset_device(pe, frozen_bus);
 		if (rc) {
-			pr_warning("%s: Unable to reset, err=%d\n",
-				   __func__, rc);
+			pr_warn("%s: Unable to reset, err=%d\n",
+				__func__, rc);
 			goto hard_fail;
 		}
 	}
@@ -666,7 +678,7 @@ static void eeh_handle_normal_event(struct eeh_pe *pe)
 
 	/* If any device has a hard failure, then shut off everything. */
 	if (result == PCI_ERS_RESULT_DISCONNECT) {
-		pr_warning("EEH: Device driver gave up\n");
+		pr_warn("EEH: Device driver gave up\n");
 		goto hard_fail;
 	}
 
@@ -675,8 +687,8 @@ static void eeh_handle_normal_event(struct eeh_pe *pe)
 		pr_info("EEH: Reset without hotplug activity\n");
 		rc = eeh_reset_device(pe, NULL);
 		if (rc) {
-			pr_warning("%s: Cannot reset, err=%d\n",
-				   __func__, rc);
+			pr_warn("%s: Cannot reset, err=%d\n",
+				__func__, rc);
 			goto hard_fail;
 		}
 
@@ -689,7 +701,7 @@ static void eeh_handle_normal_event(struct eeh_pe *pe)
 	/* All devices should claim they have recovered by now. */
 	if ((result != PCI_ERS_RESULT_RECOVERED) &&
 	    (result != PCI_ERS_RESULT_NONE)) {
-		pr_warning("EEH: Not recovered\n");
+		pr_warn("EEH: Not recovered\n");
 		goto hard_fail;
 	}
 
@@ -758,7 +770,7 @@ static void eeh_handle_special_event(void)
 			eeh_serialize_lock(&flags);
 
 			/* Purge all events */
-			eeh_remove_event(NULL);
+			eeh_remove_event(NULL, true);
 
 			list_for_each_entry(hose, &hose_list, list_node) {
 				phb_pe = eeh_phb_pe_get(hose);
@@ -777,7 +789,7 @@ static void eeh_handle_special_event(void)
 			eeh_serialize_lock(&flags);
 
 			/* Purge all events of the PHB */
-			eeh_remove_event(pe);
+			eeh_remove_event(pe, true);
 
 			if (rc == EEH_NEXT_ERR_DEAD_PHB)
 				eeh_pe_state_mark(pe, EEH_PE_ISOLATED);

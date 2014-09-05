@@ -35,11 +35,14 @@
 #include <asm/rtas.h>
 #include <asm/opal.h>
 #include <asm/kexec.h>
+#include <asm/smp.h>
 
 #include "powernv.h"
 
 static void __init pnv_setup_arch(void)
 {
+	set_arch_panic_timeout(10, ARCH_PANIC_TIMEOUT);
+
 	/* Initialize SMP */
 	pnv_smp_init();
 
@@ -261,6 +264,8 @@ static void __init pnv_setup_machdep_opal(void)
 	ppc_md.halt = pnv_halt;
 	ppc_md.machine_check_exception = opal_machine_check;
 	ppc_md.mce_check_early_recovery = opal_mce_check_early_recovery;
+	ppc_md.hmi_exception_early = opal_hmi_exception_early;
+	ppc_md.handle_hmi_exception = opal_handle_hmi_exception;
 }
 
 #ifdef CONFIG_PPC_POWERNV_RTAS

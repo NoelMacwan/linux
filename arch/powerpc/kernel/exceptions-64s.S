@@ -188,10 +188,6 @@ ALT_FTR_SECTION_END_IFSET(CPU_FTR_HVMODE)
 data_access_pSeries:
 	HMT_MEDIUM_PPR_DISCARD
 	SET_SCRATCH0(r13)
-BEGIN_FTR_SECTION
-	b	data_access_check_stab
-data_access_not_stab:
-END_MMU_FTR_SECTION_IFCLR(MMU_FTR_SLB)
 	EXCEPTION_PROLOG_PSERIES(PACA_EXGEN, data_access_common, EXC_STD,
 				 KVMTEST, 0x300)
 
@@ -339,7 +335,7 @@ emulation_assist_trampoline:
 hv_exception_trampoline:
 	SET_SCRATCH0(r13)
 	EXCEPTION_PROLOG_0(PACA_EXGEN)
-	b	hmi_exception_hv
+	b	hmi_exception_early
 
 	. = 0xe80
 hv_doorbell_trampoline:
@@ -439,9 +435,9 @@ BEGIN_FTR_SECTION
 	 * R9		= CR
 	 * Original R9 to R13 is saved on PACA_EXMC
 	 *
-	 * Switch to mc_emergency stack and handle re-entrancy (though we
-	 * currently don't test for overflow). Save MCE registers srr1,
-	 * srr0, dar and dsisr and then set ME=1
+	 * Switch to mc_emergency stack and handle re-entrancy (we limit
+	 * the nested MCE upto level 4 to avoid stack overflow).
+	 * Save MCE registers srr1, srr0, dar and dsisr and then set ME=1
 	 *
 	 * We use paca->in_mce to check whether this is the first entry or
 	 * nested machine check. We increment paca->in_mce to track nested
@@ -464,6 +460,9 @@ BEGIN_FTR_SECTION
 0:	subi	r1,r1,INT_FRAME_SIZE	/* alloc stack frame */
 	addi	r10,r10,1		/* increment paca->in_mce */
 	sth	r10,PACA_IN_MCE(r13)
+	/* Limit nested MCE to level 4 to avoid stack overflow */
+	cmpwi	r10,4
+	bgt	2f			/* Check if we hit limit of 4 */
 	std	r11,GPR1(r1)		/* Save r1 on the stack. */
 	std	r11,0(r1)		/* make stack chain pointer */
 	mfspr	r11,SPRN_SRR0		/* Save SRR0 */
@@ -482,9 +481,22 @@ BEGIN_FTR_SECTION
 	ori	r11,r11,MSR_RI		/* turn on RI bit */
 	ld	r12,PACAKBASE(r13)	/* get high part of &label */
 	LOAD_HANDLER(r12, machine_check_handle_early)
-	mtspr	SPRN_SRR0,r12
+1:	mtspr	SPRN_SRR0,r12
 	mtspr	SPRN_SRR1,r11
 	rfid
+	b	.	/* prevent speculative execution */
+2:
+	/* Stack overflow. Stay on emergency stack and panic.
+	 * Keep the ME bit off while panic-ing, so that if we hit
+	 * another machine check we checkstop.
+	 */
+	addi	r1,r1,INT_FRAME_SIZE	/* go back to previous stack frame */
+	ld	r11,PACAKMSR(r13)
+	ld	r12,PACAKBASE(r13)
+	LOAD_HANDLER(r12, unrecover_mce)
+	li	r10,MSR_ME
+	andc	r11,r11,r10		/* Turn off MSR_ME */
+	b	1b
 	b	.	/* prevent speculative execution */
 END_FTR_SECTION_IFSET(CPU_FTR_HVMODE)
 
@@ -498,34 +510,6 @@ machine_check_pSeries_0:
 	EXCEPTION_PROLOG_1(PACA_EXMC, KVMTEST, 0x200)
 	EXCEPTION_PROLOG_PSERIES_1(machine_check_common, EXC_STD)
 	KVM_HANDLER_SKIP(PACA_EXMC, EXC_STD, 0x200)
-
-	/* moved from 0x300 */
-data_access_check_stab:
-	GET_PACA(r13)
-	std	r9,PACA_EXSLB+EX_R9(r13)
-	std	r10,PACA_EXSLB+EX_R10(r13)
-	mfspr	r10,SPRN_DAR
-	mfspr	r9,SPRN_DSISR
-	srdi	r10,r10,60
-	rlwimi	r10,r9,16,0x20
-#ifdef CONFIG_KVM_BOOK3S_PR_POSSIBLE
-	lbz	r9,HSTATE_IN_GUEST(r13)
-	rlwimi	r10,r9,8,0x300
-#endif
-	mfcr	r9
-	cmpwi	r10,0x2c
-	beq	do_stab_bolted_pSeries
-	mtcrf	0x80,r9
-	ld	r9,PACA_EXSLB+EX_R9(r13)
-	ld	r10,PACA_EXSLB+EX_R10(r13)
-	b	data_access_not_stab
-do_stab_bolted_pSeries:
-	std	r11,PACA_EXSLB+EX_R11(r13)
-	std	r12,PACA_EXSLB+EX_R12(r13)
-	GET_SCRATCH0(r10)
-	std	r10,PACA_EXSLB+EX_R13(r13)
-	EXCEPTION_PROLOG_PSERIES_1(do_stab_bolted, EXC_STD)
-
 	KVM_HANDLER_SKIP(PACA_EXGEN, EXC_STD, 0x300)
 	KVM_HANDLER_SKIP(PACA_EXSLB, EXC_STD, 0x380)
 	KVM_HANDLER_PR(PACA_EXGEN, EXC_STD, 0x400)
@@ -605,8 +589,9 @@ END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
 	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe22)
 	STD_EXCEPTION_HV_OOL(0xe42, emulation_assist)
 	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe42)
-	STD_EXCEPTION_HV_OOL(0xe62, hmi_exception) /* need to flush cache ? */
+	MASKABLE_EXCEPTION_HV_OOL(0xe62, hmi_exception)
 	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe62)
+
 	MASKABLE_EXCEPTION_HV_OOL(0xe82, h_doorbell)
 	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe82)
 
@@ -627,6 +612,8 @@ END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
  * - If it was a decrementer interrupt, we bump the dec to max and and return.
  * - If it was a doorbell we return immediately since doorbells are edge
  *   triggered and won't automatically refire.
+ * - If it was a HMI we return immediately since we handled it in realmode
+ *   and it won't refire.
  * - else we hard disable and return.
  * This is called with r10 containing the value to OR to the paca field.
  */
@@ -643,6 +630,8 @@ masked_##_H##interrupt:					\
 	mtspr	SPRN_DEC,r10;				\
 	b	2f;					\
 1:	cmpwi	r10,PACA_IRQ_DBELL;			\
+	beq	2f;					\
+	cmpwi	r10,PACA_IRQ_HMI;			\
 	beq	2f;					\
 	mfspr	r10,SPRN_##_H##SRR1;			\
 	rldicl	r10,r10,48,1; /* clear MSR_EE */	\
@@ -783,7 +772,7 @@ kvmppc_skip_Hinterrupt:
 	STD_EXCEPTION_COMMON(0xd00, single_step, single_step_exception)
 	STD_EXCEPTION_COMMON(0xe00, trap_0e, unknown_exception)
 	STD_EXCEPTION_COMMON(0xe40, emulation_assist, emulation_assist_interrupt)
-	STD_EXCEPTION_COMMON(0xe60, hmi_exception, unknown_exception)
+	STD_EXCEPTION_COMMON_ASYNC(0xe60, hmi_exception, handle_hmi_exception)
 #ifdef CONFIG_PPC_DOORBELL
 	STD_EXCEPTION_COMMON_ASYNC(0xe80, h_doorbell, doorbell_exception)
 #else
@@ -969,66 +958,6 @@ ppc64_runlatch_on_trampoline:
 	b	__ppc64_runlatch_on
 
 /*
- * Here we have detected that the kernel stack pointer is bad.
- * R9 contains the saved CR, r13 points to the paca,
- * r10 contains the (bad) kernel stack pointer,
- * r11 and r12 contain the saved SRR0 and SRR1.
- * We switch to using an emergency stack, save the registers there,
- * and call kernel_bad_stack(), which panics.
- */
-bad_stack:
-	ld	r1,PACAEMERGSP(r13)
-	subi	r1,r1,64+INT_FRAME_SIZE
-	std	r9,_CCR(r1)
-	std	r10,GPR1(r1)
-	std	r11,_NIP(r1)
-	std	r12,_MSR(r1)
-	mfspr	r11,SPRN_DAR
-	mfspr	r12,SPRN_DSISR
-	std	r11,_DAR(r1)
-	std	r12,_DSISR(r1)
-	mflr	r10
-	mfctr	r11
-	mfxer	r12
-	std	r10,_LINK(r1)
-	std	r11,_CTR(r1)
-	std	r12,_XER(r1)
-	SAVE_GPR(0,r1)
-	SAVE_GPR(2,r1)
-	ld	r10,EX_R3(r3)
-	std	r10,GPR3(r1)
-	SAVE_GPR(4,r1)
-	SAVE_4GPRS(5,r1)
-	ld	r9,EX_R9(r3)
-	ld	r10,EX_R10(r3)
-	SAVE_2GPRS(9,r1)
-	ld	r9,EX_R11(r3)
-	ld	r10,EX_R12(r3)
-	ld	r11,EX_R13(r3)
-	std	r9,GPR11(r1)
-	std	r10,GPR12(r1)
-	std	r11,GPR13(r1)
-BEGIN_FTR_SECTION
-	ld	r10,EX_CFAR(r3)
-	std	r10,ORIG_GPR3(r1)
-END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
-	SAVE_8GPRS(14,r1)
-	SAVE_10GPRS(22,r1)
-	lhz	r12,PACA_TRAP_SAVE(r13)
-	std	r12,_TRAP(r1)
-	addi	r11,r1,INT_FRAME_SIZE
-	std	r11,0(r1)
-	li	r12,0
-	std	r12,0(r11)
-	ld	r2,PACATOC(r13)
-	ld	r11,exception_marker@toc(r2)
-	std	r12,RESULT(r1)
-	std	r11,STACK_FRAME_OVERHEAD-16(r1)
-1:	addi	r3,r1,STACK_FRAME_OVERHEAD
-	bl	kernel_bad_stack
-	b	1b
-
-/*
  * Here r13 points to the paca, r9 contains the saved CR,
  * SRR0 and SRR1 are saved in r11 and r12,
  * r9 - r13 are saved in paca->exgen.
@@ -1041,7 +970,7 @@ data_access_common:
 	mfspr	r10,SPRN_DSISR
 	stw	r10,PACA_EXGEN+EX_DSISR(r13)
 	EXCEPTION_PROLOG_COMMON(0x300, PACA_EXGEN)
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	ld	r12,_MSR(r1)
 	ld	r3,PACA_EXGEN+EX_DAR(r13)
 	lwz	r4,PACA_EXGEN+EX_DSISR(r13)
@@ -1057,7 +986,7 @@ h_data_storage_common:
 	stw     r10,PACA_EXGEN+EX_DSISR(r13)
 	EXCEPTION_PROLOG_COMMON(0xe00, PACA_EXGEN)
 	bl      save_nvgprs
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	addi    r3,r1,STACK_FRAME_OVERHEAD
 	bl      unknown_exception
 	b       ret_from_except
@@ -1066,7 +995,7 @@ h_data_storage_common:
 	.globl instruction_access_common
 instruction_access_common:
 	EXCEPTION_PROLOG_COMMON(0x400, PACA_EXGEN)
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	ld	r12,_MSR(r1)
 	ld	r3,_NIP(r1)
 	andis.	r4,r12,0x5820
@@ -1130,7 +1059,7 @@ slb_miss_fault:
 
 unrecov_user_slb:
 	EXCEPTION_PROLOG_COMMON(0x4200, PACA_EXGEN)
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	bl	save_nvgprs
 1:	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	unrecoverable_exception
@@ -1153,7 +1082,7 @@ machine_check_common:
 	stw	r10,PACA_EXGEN+EX_DSISR(r13)
 	EXCEPTION_PROLOG_COMMON(0x200, PACA_EXMC)
 	FINISH_NAP
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	ld	r3,PACA_EXGEN+EX_DAR(r13)
 	lwz	r4,PACA_EXGEN+EX_DSISR(r13)
 	std	r3,_DAR(r1)
@@ -1176,7 +1105,7 @@ alignment_common:
 	std	r3,_DAR(r1)
 	std	r4,_DSISR(r1)
 	bl	save_nvgprs
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	alignment_exception
 	b	ret_from_except
@@ -1186,7 +1115,7 @@ alignment_common:
 program_check_common:
 	EXCEPTION_PROLOG_COMMON(0x700, PACA_EXGEN)
 	bl	save_nvgprs
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	program_check_exception
 	b	ret_from_except
@@ -1197,7 +1126,7 @@ fp_unavailable_common:
 	EXCEPTION_PROLOG_COMMON(0x800, PACA_EXGEN)
 	bne	1f			/* if from user, just load it up */
 	bl	save_nvgprs
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	kernel_fp_unavailable_exception
 	BUG_OPCODE
@@ -1216,7 +1145,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_TM)
 #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
 2:	/* User process was in a transaction */
 	bl	save_nvgprs
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	fp_unavailable_tm
 	b	ret_from_except
@@ -1242,7 +1171,7 @@ BEGIN_FTR_SECTION
 #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
 2:	/* User process was in a transaction */
 	bl	save_nvgprs
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	altivec_unavailable_tm
 	b	ret_from_except
@@ -1251,7 +1180,7 @@ BEGIN_FTR_SECTION
 END_FTR_SECTION_IFSET(CPU_FTR_ALTIVEC)
 #endif
 	bl	save_nvgprs
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	altivec_unavailable_exception
 	b	ret_from_except
@@ -1276,7 +1205,7 @@ BEGIN_FTR_SECTION
 #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
 2:	/* User process was in a transaction */
 	bl	save_nvgprs
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	vsx_unavailable_tm
 	b	ret_from_except
@@ -1285,7 +1214,7 @@ BEGIN_FTR_SECTION
 END_FTR_SECTION_IFSET(CPU_FTR_VSX)
 #endif
 	bl	save_nvgprs
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	vsx_unavailable_exception
 	b	ret_from_except
@@ -1322,11 +1251,60 @@ fwnmi_data_area:
 	. = 0x8000
 #endif /* defined(CONFIG_PPC_PSERIES) || defined(CONFIG_PPC_POWERNV) */
 
-/* Space for CPU0's segment table */
-	.balign 4096
-	.globl initial_stab
-initial_stab:
-	.space	4096
+	.globl hmi_exception_early
+hmi_exception_early:
+	EXCEPTION_PROLOG_1(PACA_EXGEN, NOTEST, 0xe60)
+	mr	r10,r1			/* Save r1			*/
+	ld	r1,PACAEMERGSP(r13)	/* Use emergency stack		*/
+	subi	r1,r1,INT_FRAME_SIZE	/* alloc stack frame		*/
+	std	r9,_CCR(r1)		/* save CR in stackframe	*/
+	mfspr	r11,SPRN_HSRR0		/* Save HSRR0 */
+	std	r11,_NIP(r1)		/* save HSRR0 in stackframe	*/
+	mfspr	r12,SPRN_HSRR1		/* Save SRR1 */
+	std	r12,_MSR(r1)		/* save SRR1 in stackframe	*/
+	std	r10,0(r1)		/* make stack chain pointer	*/
+	std	r0,GPR0(r1)		/* save r0 in stackframe	*/
+	std	r10,GPR1(r1)		/* save r1 in stackframe	*/
+	EXCEPTION_PROLOG_COMMON_2(PACA_EXGEN)
+	EXCEPTION_PROLOG_COMMON_3(0xe60)
+	addi	r3,r1,STACK_FRAME_OVERHEAD
+	bl	hmi_exception_realmode
+	/* Windup the stack. */
+	/* Clear MSR_RI before setting SRR0 and SRR1. */
+	li	r0,MSR_RI
+	mfmsr	r9			/* get MSR value */
+	andc	r9,r9,r0
+	mtmsrd	r9,1			/* Clear MSR_RI */
+	/* Move original HSRR0 and HSRR1 into the respective regs */
+	ld	r9,_MSR(r1)
+	mtspr	SPRN_HSRR1,r9
+	ld	r3,_NIP(r1)
+	mtspr	SPRN_HSRR0,r3
+	ld	r9,_CTR(r1)
+	mtctr	r9
+	ld	r9,_XER(r1)
+	mtxer	r9
+	ld	r9,_LINK(r1)
+	mtlr	r9
+	REST_GPR(0, r1)
+	REST_8GPRS(2, r1)
+	REST_GPR(10, r1)
+	ld	r11,_CCR(r1)
+	mtcr	r11
+	REST_GPR(11, r1)
+	REST_2GPRS(12, r1)
+	/* restore original r1. */
+	ld	r1,GPR1(r1)
+
+	/*
+	 * Go to virtual mode and pull the HMI event information from
+	 * firmware.
+	 */
+	.globl hmi_exception_after_realmode
+hmi_exception_after_realmode:
+	SET_SCRATCH0(r13)
+	EXCEPTION_PROLOG_0(PACA_EXGEN)
+	b	hmi_exception_hv
 
 #ifdef CONFIG_PPC_POWERNV
 _GLOBAL(opal_mc_secondary_handler)
@@ -1389,6 +1367,7 @@ machine_check_handle_early:
 	bl	save_nvgprs
 	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	machine_check_early
+	std	r3,RESULT(r1)	/* Save result */
 	ld	r12,_MSR(r1)
 #ifdef	CONFIG_PPC_P7_NAP
 	/*
@@ -1443,10 +1422,32 @@ machine_check_handle_early:
 	 */
 	andi.	r11,r12,MSR_RI
 	bne	2f
-1:	addi	r3,r1,STACK_FRAME_OVERHEAD
-	bl	unrecoverable_exception
-	b	1b
+1:	mfspr	r11,SPRN_SRR0
+	ld	r10,PACAKBASE(r13)
+	LOAD_HANDLER(r10,unrecover_mce)
+	mtspr	SPRN_SRR0,r10
+	ld	r10,PACAKMSR(r13)
+	/*
+	 * We are going down. But there are chances that we might get hit by
+	 * another MCE during panic path and we may run into unstable state
+	 * with no way out. Hence, turn ME bit off while going down, so that
+	 * when another MCE is hit during panic path, system will checkstop
+	 * and hypervisor will get restarted cleanly by SP.
+	 */
+	li	r3,MSR_ME
+	andc	r10,r10,r3		/* Turn off MSR_ME */
+	mtspr	SPRN_SRR1,r10
+	rfid
+	b	.
 2:
+	/*
+	 * Check if we have successfully handled/recovered from error, if not
+	 * then stay on emergency stack and panic.
+	 */
+	ld	r3,RESULT(r1)	/* Load result */
+	cmpdi	r3,0		/* see if we handled MCE successfully */
+
+	beq	1b		/* if !handled then panic */
 	/*
 	 * Return from MC interrupt.
 	 * Queue up the MCE event so that we can log it later, while
@@ -1460,6 +1461,17 @@ machine_check_handle_early:
 	MACHINE_CHECK_HANDLER_WINDUP
 	b	machine_check_pSeries
 
+unrecover_mce:
+	/* Invoke machine_check_exception to print MCE event and panic. */
+	addi	r3,r1,STACK_FRAME_OVERHEAD
+	bl	machine_check_exception
+	/*
+	 * We will not reach here. Even if we did, there is no way out. Call
+	 * unrecoverable_exception and die.
+	 */
+1:	addi	r3,r1,STACK_FRAME_OVERHEAD
+	bl	unrecoverable_exception
+	b	1b
 /*
  * r13 points to the PACA, r9 contains the saved CR,
  * r12 contain the saved SRR1, SRR0 is still ready for return
@@ -1516,7 +1528,7 @@ slb_miss_realmode:
 
 unrecov_slb:
 	EXCEPTION_PROLOG_COMMON(0x4100, PACA_EXSLB)
-	DISABLE_INTS
+	RECONCILE_IRQ_STATE(r10, r11)
 	bl	save_nvgprs
 1:	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	unrecoverable_exception
@@ -1544,12 +1556,6 @@ do_hash_page:
 	bne-	handle_page_fault	/* if not, try to insert a HPTE */
 	andis.  r0,r4,DSISR_DABRMATCH@h
 	bne-    handle_dabr_fault
-
-BEGIN_FTR_SECTION
-	andis.	r0,r4,0x0020		/* Is it a segment table fault? */
-	bne-	do_ste_alloc		/* If so handle it */
-END_MMU_FTR_SECTION_IFCLR(MMU_FTR_SLB)
-
 	CURRENT_THREAD_INFO(r11, r1)
 	lwz	r0,TI_PREEMPT(r11)	/* If we're in an "NMI" */
 	andis.	r0,r0,NMI_MASK@h	/* (i.e. an irq when soft-disabled) */
@@ -1631,113 +1637,62 @@ handle_dabr_fault:
 	bl	bad_page_fault
 	b	ret_from_except
 
-	/* here we have a segment miss */
-do_ste_alloc:
-	bl	ste_allocate		/* try to insert stab entry */
-	cmpdi	r3,0
-	bne-	handle_page_fault
-	b	fast_exception_return
-
 /*
- * r13 points to the PACA, r9 contains the saved CR,
+ * Here we have detected that the kernel stack pointer is bad.
+ * R9 contains the saved CR, r13 points to the paca,
+ * r10 contains the (bad) kernel stack pointer,
  * r11 and r12 contain the saved SRR0 and SRR1.
- * r9 - r13 are saved in paca->exslb.
- * We assume we aren't going to take any exceptions during this procedure.
- * We assume (DAR >> 60) == 0xc.
+ * We switch to using an emergency stack, save the registers there,
+ * and call kernel_bad_stack(), which panics.
  */
-	.align	7
-do_stab_bolted:
-	stw	r9,PACA_EXSLB+EX_CCR(r13)	/* save CR in exc. frame */
-	std	r11,PACA_EXSLB+EX_SRR0(r13)	/* save SRR0 in exc. frame */
-	mfspr	r11,SPRN_DAR			/* ea */
-
-	/*
-	 * check for bad kernel/user address
-	 * (ea & ~REGION_MASK) >= PGTABLE_RANGE
-	 */
-	rldicr. r9,r11,4,(63 - 46 - 4)
-	li	r9,0	/* VSID = 0 for bad address */
-	bne-	0f
-
-	/*
-	 * Calculate VSID:
-	 * This is the kernel vsid, we take the top for context from
-	 * the range. context = (MAX_USER_CONTEXT) + ((ea >> 60) - 0xc) + 1
-	 * Here we know that (ea >> 60) == 0xc
-	 */
-	lis	r9,(MAX_USER_CONTEXT + 1)@ha
-	addi	r9,r9,(MAX_USER_CONTEXT + 1)@l
-
-	srdi	r10,r11,SID_SHIFT
-	rldimi  r10,r9,ESID_BITS,0 /* proto vsid */
-	ASM_VSID_SCRAMBLE(r10, r9, 256M)
-	rldic	r9,r10,12,16	/* r9 = vsid << 12 */
-
-0:
-	/* Hash to the primary group */
-	ld	r10,PACASTABVIRT(r13)
-	srdi	r11,r11,SID_SHIFT
-	rldimi	r10,r11,7,52	/* r10 = first ste of the group */
-
-	/* Search the primary group for a free entry */
-1:	ld	r11,0(r10)	/* Test valid bit of the current ste	*/
-	andi.	r11,r11,0x80
-	beq	2f
-	addi	r10,r10,16
-	andi.	r11,r10,0x70
-	bne	1b
-
-	/* Stick for only searching the primary group for now.		*/
-	/* At least for now, we use a very simple random castout scheme */
-	/* Use the TB as a random number ;  OR in 1 to avoid entry 0	*/
-	mftb	r11
-	rldic	r11,r11,4,57	/* r11 = (r11 << 4) & 0x70 */
-	ori	r11,r11,0x10
-
-	/* r10 currently points to an ste one past the group of interest */
-	/* make it point to the randomly selected entry			*/
-	subi	r10,r10,128
-	or 	r10,r10,r11	/* r10 is the entry to invalidate	*/
-
-	isync			/* mark the entry invalid		*/
-	ld	r11,0(r10)
-	rldicl	r11,r11,56,1	/* clear the valid bit */
-	rotldi	r11,r11,8
-	std	r11,0(r10)
-	sync
-
-	clrrdi	r11,r11,28	/* Get the esid part of the ste		*/
-	slbie	r11
-
-2:	std	r9,8(r10)	/* Store the vsid part of the ste	*/
-	eieio
-
-	mfspr	r11,SPRN_DAR		/* Get the new esid			*/
-	clrrdi	r11,r11,28	/* Permits a full 32b of ESID		*/
-	ori	r11,r11,0x90	/* Turn on valid and kp			*/
-	std	r11,0(r10)	/* Put new entry back into the stab	*/
-
-	sync
-
-	/* All done -- return from exception. */
-	lwz	r9,PACA_EXSLB+EX_CCR(r13)	/* get saved CR */
-	ld	r11,PACA_EXSLB+EX_SRR0(r13)	/* get saved SRR0 */
-
-	andi.	r10,r12,MSR_RI
-	beq-	unrecov_slb
-
-	mtcrf	0x80,r9			/* restore CR */
-
-	mfmsr	r10
-	clrrdi	r10,r10,2
-	mtmsrd	r10,1
-
-	mtspr	SPRN_SRR0,r11
-	mtspr	SPRN_SRR1,r12
-	ld	r9,PACA_EXSLB+EX_R9(r13)
-	ld	r10,PACA_EXSLB+EX_R10(r13)
-	ld	r11,PACA_EXSLB+EX_R11(r13)
-	ld	r12,PACA_EXSLB+EX_R12(r13)
-	ld	r13,PACA_EXSLB+EX_R13(r13)
-	rfid
-	b	.	/* prevent speculative execution */
+bad_stack:
+	ld	r1,PACAEMERGSP(r13)
+	subi	r1,r1,64+INT_FRAME_SIZE
+	std	r9,_CCR(r1)
+	std	r10,GPR1(r1)
+	std	r11,_NIP(r1)
+	std	r12,_MSR(r1)
+	mfspr	r11,SPRN_DAR
+	mfspr	r12,SPRN_DSISR
+	std	r11,_DAR(r1)
+	std	r12,_DSISR(r1)
+	mflr	r10
+	mfctr	r11
+	mfxer	r12
+	std	r10,_LINK(r1)
+	std	r11,_CTR(r1)
+	std	r12,_XER(r1)
+	SAVE_GPR(0,r1)
+	SAVE_GPR(2,r1)
+	ld	r10,EX_R3(r3)
+	std	r10,GPR3(r1)
+	SAVE_GPR(4,r1)
+	SAVE_4GPRS(5,r1)
+	ld	r9,EX_R9(r3)
+	ld	r10,EX_R10(r3)
+	SAVE_2GPRS(9,r1)
+	ld	r9,EX_R11(r3)
+	ld	r10,EX_R12(r3)
+	ld	r11,EX_R13(r3)
+	std	r9,GPR11(r1)
+	std	r10,GPR12(r1)
+	std	r11,GPR13(r1)
+BEGIN_FTR_SECTION
+	ld	r10,EX_CFAR(r3)
+	std	r10,ORIG_GPR3(r1)
+END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
+	SAVE_8GPRS(14,r1)
+	SAVE_10GPRS(22,r1)
+	lhz	r12,PACA_TRAP_SAVE(r13)
+	std	r12,_TRAP(r1)
+	addi	r11,r1,INT_FRAME_SIZE
+	std	r11,0(r1)
+	li	r12,0
+	std	r12,0(r11)
+	ld	r2,PACATOC(r13)
+	ld	r11,exception_marker@toc(r2)
+	std	r12,RESULT(r1)
+	std	r11,STACK_FRAME_OVERHEAD-16(r1)
+1:	addi	r3,r1,STACK_FRAME_OVERHEAD
+	bl	kernel_bad_stack
+	b	1b
